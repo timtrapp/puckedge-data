@@ -163,14 +163,28 @@ def main():
                 "Chrome/129.0.0.0 Safari/537.36"
             )
         )
+
+        # Block third-party ad/analytics scripts so pages finish loading immediately
+        context.route(
+            "**/*",
+            lambda route: route.continue_()
+            if "myhockeyrankings.com" in route.request.url
+            else route.abort(),
+        )
+
         page = context.new_page()
 
         for cat in CATEGORIES:
             print(f"Fetching {cat['label']} -> {cat['url']}")
-            page.goto(cat["url"], wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(2000)
+            page.goto(cat["url"], wait_until="domcontentloaded", timeout=45000)
 
-            # Extract rendered table text if present, otherwise full body text
+            try:
+                page.wait_for_selector("table tr", timeout=20000)
+                page.wait_for_timeout(1500)
+            except Exception as e:
+                print(f"  Warning waiting for table on {cat['label']}: {e}")
+                print("  Page title:", page.title())
+
             table_text = page.evaluate(
                 """() => {
                     const tables = Array.from(document.querySelectorAll('table'));
