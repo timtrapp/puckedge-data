@@ -1,6 +1,7 @@
 import json
 import re
 import sys
+import time
 from playwright.sync_api import sync_playwright
 
 CATEGORIES = [
@@ -57,6 +58,8 @@ CATEGORIES = [
 STAT_REGEX = re.compile(r"(\d{1,2}-\d{1,2}-\d{1,2})[\s\t]*(-?\d{2}(?:\.\d{1,2})?)")
 STATE_REGEX = re.compile(r"\(([A-Z]{2})\)$")
 PREFIX_STRIP_REGEX = re.compile(r"^[\d\s\u25B2\u25BC\u25B6\u25C0]+")
+
+ALLOWED_DOMAINS = ("myhockeyrankings.com", "cloudflare.com", "gstatic.com", "googleapis.com")
 
 
 def parse_page_text(raw_text, category):
@@ -151,64 +154,91 @@ def parse_page_text(raw_text, category):
     return parsed
 
 
+def fetch_category(page, cat, max_attempts=3):
+    for attempt in range(1, max_attempts + 1):
+        print(f"Fetching {cat['label']} (Attempt {attempt}/{max_attempts}) -> {cat['url']}")
+        try:
+            page.goto(cat["url"], wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_selector("table tr", timeout=25000)
+            page.wait_for_timeout(1500)
+        except Exception:
+            print(f"  Page title on timeout: {page.title()}")
+            if "just a moment" in page.title().lower():
+                # Give Cloudflare challenge extra time to auto-resolve
+                page.wait_for_timeout(8000)
+
+        table_text = page.evaluate(
+            """() => {
+                const tables = Array.from(document.querySelectorAll('table'));
+                if (tables.length > 0) {
+                    return tables.map(t => t.innerText).join('\\n');
+                }
+                return document.body.innerText;
+            }"""
+        )
+
+        teams = parse_page_text(table_text, cat)
+        print(f"  Parsed {len(teams)} teams for {cat['label']}")
+
+        if len(teams) >= 100:
+            return teams
+
+        if attempt < max_attempts:
+            print("  Retrying after 5s cooldown...")
+            time.sleep(5)
+
+    return []
+
+
 def main():
     all_teams = []
+    failed_categories = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/129.0.0.0 Safari/537.36"
-            )
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 768},
+        )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
-        # Block third-party ad/analytics scripts so pages finish loading immediately
+        # Block third-party ad networks while allowing MHR + Cloudflare challenge scripts
         context.route(
             "**/*",
             lambda route: route.continue_()
-            if "myhockeyrankings.com" in route.request.url
+            if any(domain in route.request.url for domain in ALLOWED_DOMAINS)
             else route.abort(),
         )
 
         page = context.new_page()
 
-        for cat in CATEGORIES:
-            print(f"Fetching {cat['label']} -> {cat['url']}")
-            page.goto(cat["url"], wait_until="domcontentloaded", timeout=45000)
-
-            try:
-                page.wait_for_selector("table tr", timeout=20000)
-                page.wait_for_timeout(1500)
-            except Exception as e:
-                print(f"  Warning waiting for table on {cat['label']}: {e}")
-                print("  Page title:", page.title())
-
-            table_text = page.evaluate(
-                """() => {
-                    const tables = Array.from(document.querySelectorAll('table'));
-                    if (tables.length > 0) {
-                        return tables.map(t => t.innerText).join('\\n');
-                    }
-                    return document.body.innerText;
-                }"""
-            )
-
-            teams = parse_page_text(table_text, cat)
-            print(f"  Parsed {len(teams)} teams for {cat['label']}")
-            all_teams.extend(teams)
+        for idx, cat in enumerate(CATEGORIES):
+            if idx > 0:
+                time.sleep(3)  # Polite pacing between divisions to avoid rate limits
+            teams = fetch_category(page, cat)
+            if len(teams) < 100:
+                failed_categories.append(cat["label"])
+            else:
+                all_teams.extend(teams)
 
         browser.close()
 
-    # Safety check: abort before overwriting teams.json if scrape failed or was blocked
-    if len(all_teams) < 1000:
+    if failed_categories:
         print(
-            f"ERROR: Only parsed {len(all_teams)} total teams. Aborting so existing teams.json is not overwritten."
+            f"ERROR: Incomplete scrape. Missing categories: {', '.join(failed_categories)}. "
+            "Aborting so existing teams.json is not overwritten."
         )
         sys.exit(1)
 
-    # Deduplicate by team id, keeping highest rating (matching puckedge_importer.html)
     unified = {}
     for team in all_teams:
         tid = team["id"]
@@ -220,7 +250,7 @@ def main():
     with open("teams.json", "w", encoding="utf-8") as f:
         json.dump(final_teams, f, indent=2)
 
-    print(f"SUCCESS: Wrote {len(final_teams)} unique teams to teams.json.")
+    print(f"SUCCESS: Wrote {len(final_teams)} unique teams across all 8 categories to teams.json.")
 
 
 if __name__ == "__main__":
