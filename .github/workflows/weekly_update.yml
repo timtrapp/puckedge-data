@@ -1,0 +1,38 @@
+name: Weekly MHR Rankings Update
+
+on:
+  schedule:
+    # Runs automatically every Wednesday at 8:00 PM EST (01:00 UTC Thursday)
+    - cron: '0 1 * * 4'
+  workflow_dispatch: # Adds a one-click "Run workflow" button in GitHub
+
+permissions:
+  contents: write
+
+jobs:
+  update-teams:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Run MHR Scraper
+        run: python scrape_mhr.py
+
+      - name: Commit and push updated teams.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add teams.json
+          git diff --staged --quiet || git commit -m "Weekly Wednesday ratings update"
+          git push
