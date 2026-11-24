@@ -2,8 +2,8 @@ name: Weekly MHR Rankings Update
 
 on:
   schedule:
-    # Runs automatically every Wednesday at 8:00 PM EST (01:00 UTC Thursday)
-    - cron: '0 1 * * 4'
+    # Runs every Wednesday at 2:00 PM EST (19:00 UTC)
+    - cron: '0 19 * * 3'
   workflow_dispatch: # Adds a one-click "Run workflow" button in GitHub
 
 permissions:
