@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import sys
 import time
@@ -59,7 +60,9 @@ STAT_REGEX = re.compile(r"(\d{1,2}-\d{1,2}-\d{1,2})[\s\t]*(-?\d{2}(?:\.\d{1,2})?
 STATE_REGEX = re.compile(r"\(([A-Z]{2})\)$")
 PREFIX_STRIP_REGEX = re.compile(r"^[\d\s\u25B2\u25BC\u25B6\u25C0]+")
 
-ALLOWED_DOMAINS = ("myhockeyrankings.com", "cloudflare.com", "gstatic.com", "googleapis.com")
+
+def log(msg):
+    print(msg, flush=True)
 
 
 def parse_page_text(raw_text, category):
@@ -154,18 +157,28 @@ def parse_page_text(raw_text, category):
     return parsed
 
 
-def fetch_category(page, cat, max_attempts=3):
-    for attempt in range(1, max_attempts + 1):
-        print(f"Fetching {cat['label']} (Attempt {attempt}/{max_attempts}) -> {cat['url']}")
+def load_existing_teams():
+    if not os.path.exists("teams.json"):
+        return []
+    try:
+        with open("teams.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def fetch_category(page, cat):
+    for attempt in (1, 2):
+        log(f"Fetching {cat['label']} (Attempt {attempt}/2) -> {cat['url']}")
         try:
-            page.goto(cat["url"], wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_selector("table tr", timeout=25000)
-            page.wait_for_timeout(1500)
+            page.goto(cat["url"], wait_until="domcontentloaded", timeout=15000)
+            page.wait_for_selector("table tr", timeout=10000)
+            page.wait_for_timeout(1000)
         except Exception:
-            print(f"  Page title on timeout: {page.title()}")
-            if "just a moment" in page.title().lower():
-                # Give Cloudflare challenge extra time to auto-resolve
-                page.wait_for_timeout(8000)
+            title = page.title()
+            log(f"  Timeout/Challenge on {cat['label']} (Title: {title})")
+            if "just a moment" in title.lower():
+                page.wait_for_timeout(4000)
 
         table_text = page.evaluate(
             """() => {
@@ -178,21 +191,21 @@ def fetch_category(page, cat, max_attempts=3):
         )
 
         teams = parse_page_text(table_text, cat)
-        print(f"  Parsed {len(teams)} teams for {cat['label']}")
-
+        log(f"  Parsed {len(teams)} teams for {cat['label']}")
         if len(teams) >= 100:
             return teams
 
-        if attempt < max_attempts:
-            print("  Retrying after 5s cooldown...")
-            time.sleep(5)
+        if attempt == 1:
+            time.sleep(2)
 
     return []
 
 
 def main():
-    all_teams = []
-    failed_categories = []
+    existing_teams = load_existing_teams()
+    fresh_teams = []
+    succeeded_labels = set()
+    blocked_labels = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -211,11 +224,11 @@ def main():
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
-        # Block third-party ad networks while allowing MHR + Cloudflare challenge scripts
+        # Only load myhockeyrankings.com; abort external ads/trackers immediately
         context.route(
             "**/*",
             lambda route: route.continue_()
-            if any(domain in route.request.url for domain in ALLOWED_DOMAINS)
+            if "myhockeyrankings.com" in route.request.url
             else route.abort(),
         )
 
@@ -223,24 +236,28 @@ def main():
 
         for idx, cat in enumerate(CATEGORIES):
             if idx > 0:
-                time.sleep(3)  # Polite pacing between divisions to avoid rate limits
+                time.sleep(2)
             teams = fetch_category(page, cat)
-            if len(teams) < 100:
-                failed_categories.append(cat["label"])
+            if len(teams) >= 100:
+                fresh_teams.extend(teams)
+                succeeded_labels.add(cat["label"])
             else:
-                all_teams.extend(teams)
+                blocked_labels.append(cat["label"])
 
         browser.close()
 
-    if failed_categories:
-        print(
-            f"ERROR: Incomplete scrape. Missing categories: {', '.join(failed_categories)}. "
-            "Aborting so existing teams.json is not overwritten."
-        )
+    if not succeeded_labels:
+        log("ERROR: All 8 categories blocked or empty. Aborting without changes.")
         sys.exit(1)
 
+    # Keep existing teams for any category blocked by Cloudflare, merge with fresh scrapes
+    preserved_teams = [
+        t for t in existing_teams if t.get("source_category") not in succeeded_labels
+    ]
+    combined = fresh_teams + preserved_teams
+
     unified = {}
-    for team in all_teams:
+    for team in combined:
         tid = team["id"]
         if tid not in unified or unified[tid]["rating"] < team["rating"]:
             unified[tid] = team
@@ -250,7 +267,9 @@ def main():
     with open("teams.json", "w", encoding="utf-8") as f:
         json.dump(final_teams, f, indent=2)
 
-    print(f"SUCCESS: Wrote {len(final_teams)} unique teams across all 8 categories to teams.json.")
+    log(f"SUCCESS: Updated {len(succeeded_labels)}/8 categories ({len(final_teams)} total unique teams).")
+    if blocked_labels:
+        log(f"NOTE: Preserved existing data for Cloudflare-blocked categories: {', '.join(blocked_labels)}")
 
 
 if __name__ == "__main__":
